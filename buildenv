@@ -1,0 +1,264 @@
+#!/bin/bash
+#
+# script: build (or buildenv)
+# version: 1.10.1
+#
+#
+# Also consider running a local registry:
+# docker run -d --name registry -p 6000:5000 \
+#   -v $HOME/docker-registry:/var/lib/registry \
+#   --name registry \
+#   --restart always \
+#   registry:2
+#
+# versions:
+#   - 1.0.0  : original variation
+#   - 1.10.1 : rework with logs
+#
+#
+
+export VERSION="1.10.1"
+export DEBUG=false
+export DEFAULT_ENV_FILE=${DEFAULT_ENV_FILE:-"$HOME/.gitlab/local-vars.env"}
+export gitlab_yaml=".gitlab-ci.yml"
+export compact_dir=".gitlab-ci-local"  # directory where templates are stored
+export compact_yaml="$compact_dir/.gitlab-ci-local.compact.yml"
+ENVIRONMENT_EXTENSIONS=""
+
+# colors
+export COLOR_BLACK="\033[0;30m"
+export COLOR_RED="\033[0;31m"
+export COLOR_GREEN="\033[0;32m"
+export COLOR_YELLOW="\033[0;33m"
+export COLOR_BLUE="\033[0;34m"
+export COLOR_MAGENTA="\033[0;35m"
+export COLOR_CYAN="\033[0;36m"
+export COLOR_WHITE="\033[0;37m"
+export COLOR_RESET="\033[0m"
+
+
+log_info() {
+  local message="$1"
+  local color=${2:-""}
+  echo -e "${color}INFO: ${message}${COLOR_RESET}"
+}
+
+log_debug() {
+  local message="$1"
+  local color=${2:-""}
+
+  if [[ "$DEBUG" == "true" ]]; then
+    echo -e "${color}DEBUG: ${message}${COLOR_RESET}"
+  fi;
+}
+
+log_error() {
+  local message="$1"
+  local color=$COLOR_RED
+  echo -e "${color}ERROR: ${message}${COLOR_RESET}"
+  exit 1;
+}
+
+banner() {
+cat << EOF
+=================================================================================
+                              GITLAB LOCAL RUNNER
+=================================================================================
+EOF
+}
+
+
+load_env_vars() {
+  if [ -z "$env_file" ]; then
+    export env_file=$DEFAULT_ENV_FILE
+    if ! [ -f "$env_file" ]; then
+      >&2 echo "Environment file $env_file doesnt exist"
+      exit 1
+    fi
+
+    ENVIRONMENT_EXTENSIONS=$(sed -e '/^$/d' -e 's/^/--env /' $env_file | paste -s -d' ' -)
+  fi;
+
+  echo "$ENVIRONMENT_EXTENSIONS"
+}
+
+# check if a line exists in .gitignore
+line_exists_in_gitignore() {
+    if grep -qF "$1" "$gitignore_path"; then
+        return 0 # Line exists
+    else
+        return 1 # Line does not exist
+    fi
+}
+
+# add a line to .gitignore if it doesn't exist
+add_line_to_gitignore() {
+  local line_str=$1
+  local gitignore_path=$2
+  local comment=$3
+
+    if ! line_exists_in_gitignore "$line_str"; then
+      cat << EOF >> "$gitignore_path"
+
+# $comment
+$line_str
+EOF
+        log_debug "Added '$line_str' to $gitignore_path"
+    else
+        log_debug "'$line_str' already exists in $gitignore_path"
+    fi
+}
+
+add_local_gitignore() {
+  local gitignore_path=".gitignore"  # must be in cwd!
+  local line_to_check=$1
+
+  if [ ! -e $gitignore_path ]; then
+    log_error "Could not find .gitignore file, please create it or check the current working directory. Exiting."
+  else
+    add_line_to_gitignore $line_to_check $gitignore_path "ci-local"
+  fi;
+}
+
+# Note: if there is no 'variables' section in the '.gitlab-ci.yml' file, the compact yaml will end up
+#       with 'variables: null'. This is still valid syntax from a gitlab standpoint.
+generate_compact() {
+  if [ -e  $gitlab_yaml ]; then
+    log_debug "Generating flat job yaml from [$gitlab_yaml] as [$compact_yaml] ..."
+    gitlab-ci-local --file $gitlab_yaml --preview > $compact_yaml
+    GITLAB_VARS=$(yq '.variables' $gitlab_yaml) yq -i '.variables = env(GITLAB_VARS)' $compact_yaml
+    log_debug "$(cat $compact_yaml)"
+  fi;
+}
+
+usage() {
+  cat << EOF
+
+  usage:
+
+    build [flags] <job>
+      [-v|--debug]               : debug mode
+      [-e|--env]                 : env file to use, overrides default
+      [-h|--help]                : displays usage
+      [-v|--version]             : displays version
+EOF
+
+printf "\n\n${COLOR_RED}WARNING${COLOR_RESET}: flags MUST be first!\n\n"
+
+}
+
+print_in_color() {
+  local color="$1"
+  local message="$2"
+
+  echo -e "${color}${message}${RESET}"
+}
+
+# Reset the color
+reset_color() {
+  echo -e "${RESET}"
+}
+
+main() {
+  export flag_help
+  export flag_debug=(false)
+  export arg_envfile=($DEFAULT_ENV_FILE)
+
+  banner
+
+  # Parse the command-line options
+  optstring="hdve:"
+  while getopts "$optstring" opt; do
+    case "$opt" in
+      h)
+        # Set the flag_help flag
+        flag_help=true
+        usage
+        exit 1
+        ;;
+      d)
+        # Set the flag_debug flag
+        flag_debug=true
+        ;;
+      v)
+        # Print the version
+        echo "version: $VERSION"
+        exit 1;
+        ;;
+      e)
+        # Set the arg_envfile variable
+        arg_envfile="$OPTARG"
+        ;;
+      ?)
+        # Invalid command-line option
+        echo "Usage: $0 [-hdv] [-e <environment file>]"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ ! -z "$flag_debug" ]; then
+    export DEBUG=true
+    log_debug "debug=enabled"
+    log_debug "env file=$arg_envfile"
+  fi;
+
+  local env_file=$arg_envfile
+  if [ ! -z "$env_file" ]; then
+      log_debug "Using env file: $env_file"
+      shift $((OPTIND -1))
+
+      if ! [ -f "$env_file" ]; then
+        >&2 log_info "Environment file [$env_file] doesn't exist"
+        exit 1
+      fi
+
+      ENVIRONMENT_EXTENSIONS=$(sed -e '/^$/d' -e 's/^/--env /' $env_file | paste -s -d' ' -)
+  fi;
+
+  # process env vars first since this is fast
+  load_env_vars
+
+  add_local_gitignore '.gitlab-ci-local*'
+
+  if [ ! -e $compact_dir ]; then
+    mkdir -vp $compact_dir
+  fi;
+
+  # generate compact version of gitlab-ci.yml, WARNING!! can be slow!!
+  generate_compact
+
+  local job=$1
+  if [ -z "$job" ]; then
+    log_error "${COLOR_RED}please specify job, see -h for help${COLOR_RESET}"
+  else
+    log_debug "job to run is [$job]"
+  fi;
+
+  if [ -e $compact_yaml ]; then
+    log_debug "Found compact yaml file [$compact_yaml], using it ..."
+
+    gitlab-runner exec docker --docker-privileged \
+      --cicd-config-file=$compact_yaml \
+      --docker-network-mode=host \
+      --docker-volumes $HOME/gitlab-local-build-cache:/tmp/local-build-cache:rw \
+      --docker-volumes $HOME/.docker:/root/.docker:ro \
+      --docker-volumes /var/run/docker.sock:/var/run/docker.sock:ro \
+      $ENVIRONMENT_EXTENSIONS "$job"
+
+  elif [ -e $gitlab_yaml ]; then
+    log_debug "Found normal yaml file [$gitlab_yaml], using it ..."
+    gitlab-runner exec docker --docker-privileged \
+      --docker-network-mode=host \
+      --docker-volumes $HOME/gitlab-local-build-cache:/tmp/local-build-cache:rw \
+      --docker-volumes $HOME/.docker:/root/.docker:ro \
+      --docker-volumes /var/run/docker.sock:/var/run/docker.sock:ro \
+      $ENVIRONMENT_EXTENSIONS \
+      $job
+  else
+    log_info "Could not find [$gitlab_yaml], or [$compact_yaml]. Exiting ..."
+    exit 1;
+  fi;
+}
+
+main $@
